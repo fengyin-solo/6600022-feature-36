@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import type { BoardState, Move, GameRecord, AIConfig, GameStatus } from '../types';
 
 const BOARD_SIZE = 15;
@@ -7,11 +7,15 @@ const EMPTY = 0;
 const BLACK = 1;
 const WHITE = 2;
 
+const MAX_HISTORY_RECORDS = 50;
+const FREQUENT_VIEW_THRESHOLD = 3;
+const RECENT_DAYS_THRESHOLD = 7;
+const STORAGE_KEY = 'gobang-game-records';
+const CONFIG_STORAGE_KEY = 'gobang-ai-config';
+
 function createEmptyBoard(): BoardState {
   return Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(EMPTY));
 }
-
-// --- AI: Minimax + Alpha-Beta Pruning ---
 
 const SCORE_TABLE: Record<string, number> = {
   'five': 1000000,
@@ -189,7 +193,70 @@ function getAIMove(board: BoardState, aiPlayer: number, depth: number): [number,
   return bestMove;
 }
 
-// --- Store ---
+function isFrequentlyUsed(record: GameRecord): boolean {
+  if (record.viewCount >= FREQUENT_VIEW_THRESHOLD) return true;
+  const daysSinceLastView = (Date.now() - record.lastViewedAt) / (1000 * 60 * 60 * 24);
+  return daysSinceLastView <= RECENT_DAYS_THRESHOLD;
+}
+
+function cleanupRecords(records: GameRecord[]): GameRecord[] {
+  if (records.length <= MAX_HISTORY_RECORDS) return records;
+
+  const protectedIds = new Set<string>();
+  for (const r of records) {
+    if (r.isFavorite || isFrequentlyUsed(r)) {
+      protectedIds.add(r.id);
+    }
+  }
+
+  const candidates: GameRecord[] = [];
+  const protectedRecords: GameRecord[] = [];
+  for (const r of records) {
+    if (protectedIds.has(r.id)) {
+      protectedRecords.push(r);
+    } else {
+      candidates.push(r);
+    }
+  }
+
+  candidates.sort((a, b) => a.lastViewedAt - b.lastViewedAt);
+
+  const targetCount = MAX_HISTORY_RECORDS - protectedRecords.length;
+  if (candidates.length <= targetCount) {
+    return records;
+  }
+
+  const kept = candidates.slice(0, targetCount);
+  const result = [...protectedRecords, ...kept];
+  result.sort((a, b) => {
+    const aTime = a.moves.length > 0 ? a.moves[0].timestamp : 0;
+    const bTime = b.moves.length > 0 ? b.moves[0].timestamp : 0;
+    return bTime - aTime;
+  });
+  return result;
+}
+
+function loadRecordsFromStorage(): GameRecord[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed as GameRecord[];
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+function loadConfigFromStorage(): AIConfig | null {
+  try {
+    const raw = localStorage.getItem(CONFIG_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as AIConfig;
+  } catch {
+    return null;
+  }
+}
 
 export const useGameStore = defineStore('game', () => {
   const board = ref<BoardState>(createEmptyBoard());
@@ -197,11 +264,10 @@ export const useGameStore = defineStore('game', () => {
   const moves = ref<Move[]>([]);
   const status = ref<GameStatus>('idle');
   const winner = ref<number | null>(null);
-  const gameRecords = ref<GameRecord[]>([]);
-  const aiConfig = ref<AIConfig>({ depth: 3, enabled: true, playerColor: WHITE });
+  const gameRecords = ref<GameRecord[]>(loadRecordsFromStorage());
+  const aiConfig = ref<AIConfig>(loadConfigFromStorage() ?? { depth: 3, enabled: true, playerColor: WHITE });
   const isAiThinking = ref(false);
 
-  // Replay
   const replayMoves = ref<Move[]>([]);
   const replayIndex = ref(0);
   const replayBoard = ref<BoardState>(createEmptyBoard());
@@ -210,6 +276,23 @@ export const useGameStore = defineStore('game', () => {
 
   const currentMoveCount = computed(() => moves.value.length);
   const isGameOver = computed(() => status.value === 'finished');
+  const favoriteCount = computed(() => gameRecords.value.filter(r => r.isFavorite).length);
+  const recordCount = computed(() => gameRecords.value.length);
+  const maxRecords = computed(() => MAX_HISTORY_RECORDS);
+
+  watch(gameRecords, (records) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+    } catch {
+    }
+  }, { deep: true });
+
+  watch(aiConfig, (config) => {
+    try {
+      localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
+    } catch {
+    }
+  }, { deep: true });
 
   function startGame() {
     board.value = createEmptyBoard();
@@ -262,17 +345,45 @@ export const useGameStore = defineStore('game', () => {
   }
 
   function saveRecord() {
+    const now = Date.now();
     const record: GameRecord = {
-      id: Date.now().toString(),
+      id: now.toString(),
       moves: [...moves.value],
       winner: winner.value,
       createdAt: new Date().toLocaleString('zh-CN'),
       duration: moves.value.length > 0 ? moves.value[moves.value.length - 1].timestamp - moves.value[0].timestamp : 0,
+      isFavorite: false,
+      viewCount: 0,
+      lastViewedAt: now,
     };
     gameRecords.value.unshift(record);
+    gameRecords.value = cleanupRecords(gameRecords.value);
+  }
+
+  function toggleFavorite(recordId: string) {
+    const record = gameRecords.value.find(r => r.id === recordId);
+    if (record) {
+      record.isFavorite = !record.isFavorite;
+    }
+  }
+
+  function deleteRecord(recordId: string) {
+    const idx = gameRecords.value.findIndex(r => r.id === recordId);
+    if (idx >= 0) {
+      gameRecords.value.splice(idx, 1);
+    }
+  }
+
+  function trackRecordView(recordId: string) {
+    const record = gameRecords.value.find(r => r.id === recordId);
+    if (record) {
+      record.viewCount += 1;
+      record.lastViewedAt = Date.now();
+    }
   }
 
   function startReplay(record: GameRecord) {
+    trackRecordView(record.id);
     replayMoves.value = [...record.moves];
     replayIndex.value = 0;
     replayBoard.value = createEmptyBoard();
@@ -358,8 +469,9 @@ export const useGameStore = defineStore('game', () => {
   return {
     board, currentPlayer, moves, status, winner, gameRecords, aiConfig, isAiThinking,
     replayMoves, replayIndex, replayBoard, isReplayPlaying, replaySpeed,
-    currentMoveCount, isGameOver,
+    currentMoveCount, isGameOver, favoriteCount, recordCount, maxRecords,
     startGame, placeStone, aiMove, saveRecord,
+    toggleFavorite, deleteRecord, trackRecordView,
     startReplay, replayStepForward, replayStepBack, replayGoToStart, replayGoToEnd,
     toggleReplayPlay, setReplaySpeed, stopReplay, checkWin,
   };

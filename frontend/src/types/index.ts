@@ -10,9 +10,12 @@ export interface Move {
 export interface GameRecord {
   id: string;
   moves: Move[];
-  winner: number | null; // 0=draw, 1=black, 2=white, null=ongoing
+  winner: number | null;
   createdAt: string;
   duration: number;
+  isFavorite: boolean;
+  viewCount: number;
+  lastViewedAt: number;
 }
 
 export interface AIConfig {
